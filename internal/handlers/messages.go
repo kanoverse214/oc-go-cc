@@ -106,6 +106,11 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	h.logger.Debug("raw request body",
+		"body", truncateJSON(rawBody, 2000),
+		"request_id", requestID,
+	)
+
 	// Deduplicate - skip duplicate requests
 	if _, ok := h.requestDedup.TryAcquire(rawBody); !ok {
 		h.metrics.RecordDeduplicated()
@@ -159,14 +164,12 @@ func (h *MessagesHandler) handleStreaming(
 	rw := &responseWriter{ResponseWriter: w}
 
 	// Set SSE headers immediately so Claude Code knows the stream is alive.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	rw.Header().Set("Cache-Control", "no-cache")
+	rw.Header().Set("Connection", "keep-alive")
+	rw.Header().Set("X-Accel-Buffering", "no")
+	rw.WriteHeader(http.StatusOK)
+	rw.Flush()
 
 	// Start heartbeat to keep connection alive while waiting for upstream.
 	heartbeatDone := make(chan struct{})
@@ -176,10 +179,8 @@ func (h *MessagesHandler) handleStreaming(
 		for {
 			select {
 			case <-ticker.C:
-				_, _ = fmt.Fprintf(w, ":keepalive\n\n")
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
+				_, _ = fmt.Fprintf(rw, ":keepalive\n\n")
+				rw.Flush()
 			case <-heartbeatDone:
 				return
 			case <-clientCtx.Done():
@@ -222,6 +223,12 @@ func (h *MessagesHandler) handleStreaming(
 		return
 	}
 
+	openaiBody, _ := json.Marshal(openaiReq)
+	h.logger.Debug("transformed request",
+		"model", modelID,
+		"body", truncateJSON(openaiBody, 2000),
+	)
+
 	streamBody, err := h.client.GetStreamingBody(ctx, modelID, openaiReq)
 	if err != nil {
 		if clientCtx.Err() == context.Canceled {
@@ -234,6 +241,8 @@ func (h *MessagesHandler) handleStreaming(
 		return
 	}
 	defer streamBody.Close()
+
+	h.logger.Debug("starting stream proxy", "model", modelID)
 
 	if err := h.streamHandler.ProxyStream(rw, streamBody, modelID, clientCtx); err != nil {
 		if err == transformer.ErrClientDisconnected || clientCtx.Err() == context.Canceled {
@@ -327,11 +336,22 @@ func (h *MessagesHandler) sendStreamError(w http.ResponseWriter, message string)
 	}
 
 	data, _ := json.Marshal(errorEvent)
+	h.logger.Debug("sending SSE error event", "event", truncateJSON(data, 1000))
+
 	_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(data))
 
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// truncateJSON truncates a JSON byte slice to maxLen characters for logging.
+func truncateJSON(data []byte, maxLen int) string {
+	s := string(data)
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
 }
 
 // handleNonStreaming handles a non-streaming request.

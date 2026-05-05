@@ -110,6 +110,7 @@ func HasThinkingBlocks(messages []types.Message) bool {
 // transformMessages converts Anthropic messages to OpenAI format.
 func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageRequest, modelID string) ([]types.ChatMessage, error) {
 	hasThinking := HasThinkingBlocks(anthropicReq.Messages)
+	thinkingRequested := hasThinking || (anthropicReq.OutputConfig != nil && anthropicReq.OutputConfig.Effort != "")
 
 	var result []types.ChatMessage
 
@@ -137,7 +138,7 @@ func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageReques
 
 	// Transform each message
 	for _, msg := range anthropicReq.Messages {
-		openaiMsgs, err := t.transformMessage(msg, modelID, hasThinking)
+		openaiMsgs, err := t.transformMessage(msg, modelID, thinkingRequested)
 		if err != nil {
 			return nil, err
 		}
@@ -149,14 +150,14 @@ func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageReques
 
 // transformMessage converts a single Anthropic message to one or more OpenAI messages.
 // Tool_use and tool_result require special handling to map to OpenAI's function calling format.
-func (t *RequestTransformer) transformMessage(msg types.Message, modelID string, hasThinkingInHistory bool) ([]types.ChatMessage, error) {
+func (t *RequestTransformer) transformMessage(msg types.Message, modelID string, thinkingRequested bool) ([]types.ChatMessage, error) {
 	blocks := msg.ContentBlocks()
 
 	switch msg.Role {
 	case "user":
 		return t.transformUserMessage(blocks)
 	case "assistant":
-		return t.transformAssistantMessage(blocks, modelID, hasThinkingInHistory)
+		return t.transformAssistantMessage(blocks, modelID, thinkingRequested)
 	default:
 		// Fallback: concatenate all text
 		var text string
@@ -210,7 +211,7 @@ func (t *RequestTransformer) transformUserMessage(blocks []types.ContentBlock) (
 }
 
 // transformAssistantMessage converts an assistant message with potential tool_use blocks.
-func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlock, modelID string, hasThinkingInHistory bool) ([]types.ChatMessage, error) {
+func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlock, modelID string, thinkingRequested bool) ([]types.ChatMessage, error) {
 	var textParts []string
 	var thinkingParts []string
 	var toolCalls []types.ToolCall
@@ -256,12 +257,11 @@ func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlo
 	if reasoningContent != "" {
 		// Real thinking content from the upstream history — preserve it.
 		reasoningContentPtr = &reasoningContent
-	} else if hasThinkingInHistory && len(toolCalls) > 0 && isDeepSeekModel(modelID) {
+	} else if isDeepSeekModel(modelID) && thinkingRequested {
 		// DeepSeek in thinking mode requires reasoning_content on ALL assistant
-		// messages, including tool-call turns where Claude Code didn't preserve
-		// the thinking block. Use a placeholder that won't trigger validation:
-		// DeepSeek checks for the field's presence, not its content, when the
-		// original thinking was stripped by the client.
+		// messages when thinking is enabled. Use a placeholder that won't
+		// trigger validation: DeepSeek checks for the field's presence, not its
+		// content, when the original thinking was stripped by the client.
 		placeholder := " "
 		reasoningContentPtr = &placeholder
 	} else if len(toolCalls) > 0 && needsPlaceholderReasoning(modelID) {

@@ -40,6 +40,7 @@ type ChatMessage struct {
 
 // ToolCall represents a function call made by the model.
 type ToolCall struct {
+	Index    int          `json:"index"`
 	ID       string       `json:"id"`
 	Type     string       `json:"type"`
 	Function FunctionCall `json:"function"`

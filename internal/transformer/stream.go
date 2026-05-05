@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -60,6 +61,10 @@ func (h *StreamHandler) ProxyStream(
 			Model:   originalModel,
 		},
 	}
+	slog.Debug("sending SSE event",
+		"event_type", msgStart.Type,
+		"model", originalModel,
+	)
 	if err := writeSSEEvent(w, msgStart); err != nil {
 		return ErrClientDisconnected
 	}
@@ -72,7 +77,7 @@ func (h *StreamHandler) ProxyStream(
 	contentStarted := false
 	reasoningStarted := false
 	stopSent := false
-	toolUseCount := 0
+	toolCallByUpstreamIndex := map[int]int{} // upstream tool_call index → SSE content block index
 
 	// Read in larger chunks for efficiency, then parse lines
 	readBuf := make([]byte, 4096)
@@ -88,15 +93,20 @@ func (h *StreamHandler) ProxyStream(
 		// Read chunk from upstream
 		n, err := openaiResp.Read(readBuf)
 		if n > 0 {
-			// Process bytes immediately
+			if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+				slog.Debug("upstream SSE chunk",
+					"bytes", n,
+					"raw", truncateBytes(readBuf[:n], 500),
+				)
+			}
+
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
 				if b == '\n' {
 					line := lineBuf.String()
 					lineBuf.Reset()
 
-					// Process complete line
-					if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &toolUseCount, originalModel); err != nil {
+					if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, toolCallByUpstreamIndex, originalModel); err != nil {
 						return err
 					}
 				} else {
@@ -109,7 +119,7 @@ func (h *StreamHandler) ProxyStream(
 			// Process any remaining data in buffer
 			if lineBuf.Len() > 0 {
 				line := lineBuf.String()
-				if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &toolUseCount, originalModel); err != nil {
+				if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, toolCallByUpstreamIndex, originalModel); err != nil {
 					return err
 				}
 			}
@@ -142,7 +152,7 @@ func (h *StreamHandler) processSSELine(
 	contentStarted *bool,
 	reasoningStarted *bool,
 	stopSent *bool,
-	toolUseCount *int,
+	toolCallByUpstreamIndex map[int]int,
 	originalModel string,
 ) error {
 	line = strings.TrimSpace(line)
@@ -164,7 +174,17 @@ func (h *StreamHandler) processSSELine(
 
 	// Handle [DONE] marker
 	if data == "[DONE]" {
+		slog.Debug("upstream SSE [DONE]")
 		return nil
+	}
+
+	if len(data) > 200 {
+		slog.Debug("upstream SSE data",
+			"data", data[:200]+"...",
+			"len", len(data),
+		)
+	} else {
+		slog.Debug("upstream SSE data", "data", data)
 	}
 
 	// Fast path: check if this is a content chunk without full JSON parsing.
@@ -371,29 +391,35 @@ func (h *StreamHandler) processSSELine(
 		flusher.Flush()
 	}
 
-	// Handle tool call deltas
+	// Handle tool call deltas.
+	// Upstream sends tool_calls[].index to identify which tool call the delta
+	// belongs to. Only send content_block_start on first appearance of an index;
+	// subsequent deltas for the same tool call only emit input_json_delta.
 	if len(choice.Delta.ToolCalls) > 0 {
 		for _, tc := range choice.Delta.ToolCalls {
-			*contentIndex++
-			*toolUseCount++
+			sseIdx, exists := toolCallByUpstreamIndex[tc.Index]
+			if !exists {
+				*contentIndex++
+				sseIdx = *contentIndex
+				toolCallByUpstreamIndex[tc.Index] = sseIdx
 
-			input := json.RawMessage(`{}`)
-			toolID := tc.ID
-			if toolID == "" {
-				toolID = fmt.Sprintf("toolu_%s", generateID())
-			}
-			startEvent := types.MessageEvent{
-				Type:  "content_block_start",
-				Index: contentIndex,
-				ContentBlock: &types.ContentBlock{
-					Type:  "tool_use",
-					ID:    toolID,
-					Name:  tc.Function.Name,
-					Input: input,
-				},
-			}
-			if err := writeSSEEvent(w, startEvent); err != nil {
-				return ErrClientDisconnected
+				toolID := tc.ID
+				if toolID == "" {
+					toolID = fmt.Sprintf("toolu_%s", generateID())
+				}
+				startEvent := types.MessageEvent{
+					Type:  "content_block_start",
+					Index: &sseIdx,
+					ContentBlock: &types.ContentBlock{
+						Type:  "tool_use",
+						ID:    toolID,
+						Name:  tc.Function.Name,
+						Input: json.RawMessage(`{}`),
+					},
+				}
+				if err := writeSSEEvent(w, startEvent); err != nil {
+					return ErrClientDisconnected
+				}
 			}
 
 			if tc.Function.Arguments != "" {
@@ -403,7 +429,7 @@ func (h *StreamHandler) processSSELine(
 				}
 				event := types.MessageEvent{
 					Type:  "content_block_delta",
-					Index: contentIndex,
+					Index: &sseIdx,
 					Delta: &delta,
 				}
 				if err := writeSSEEvent(w, event); err != nil {
@@ -427,20 +453,16 @@ func (h *StreamHandler) processSSELine(
 			}
 		}
 
-		// Close any open tool_use blocks. Each tool call incremented contentIndex,
-		// so we need to close all of them (not just the last one).
-		if *toolUseCount > 0 {
-			for i := 0; i < *toolUseCount; i++ {
-				idx := *contentIndex - *toolUseCount + i
-				stopEvent := types.MessageEvent{
-					Type:  "content_block_stop",
-					Index: &idx,
-				}
-				if err := writeSSEEvent(w, stopEvent); err != nil {
-					return ErrClientDisconnected
-				}
+		// Close any open tool_use blocks by their SSE content block indices.
+		for _, sseIdx := range toolCallByUpstreamIndex {
+			idx := sseIdx
+			stopEvent := types.MessageEvent{
+				Type:  "content_block_stop",
+				Index: &idx,
 			}
-			*toolUseCount = 0
+			if err := writeSSEEvent(w, stopEvent); err != nil {
+				return ErrClientDisconnected
+			}
 		}
 
 		msgDelta := types.MessageEvent{
@@ -495,8 +517,30 @@ func writeSSEEvent(w http.ResponseWriter, event types.MessageEvent) error {
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
+	if len(data) > 500 {
+		slog.Debug("sending SSE event",
+			"event_type", event.Type,
+			"data", string(data[:500])+"...",
+			"data_len", len(data),
+		)
+	} else {
+		slog.Debug("sending SSE event",
+			"event_type", event.Type,
+			"data", string(data),
+		)
+	}
+
 	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, string(data))
 	return err
+}
+
+// truncateBytes truncates a byte slice to maxLen for debug logging.
+func truncateBytes(b []byte, maxLen int) string {
+	s := string(b)
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
 }
 
 // generateID creates a unique identifier based on current time.
