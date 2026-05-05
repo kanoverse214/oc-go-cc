@@ -5,37 +5,27 @@ import (
 	"net/http"
 
 	"oc-go-cc/internal/metrics"
-	"oc-go-cc/internal/router"
 	"oc-go-cc/internal/token"
 	"oc-go-cc/pkg/types"
 )
 
 // HealthHandler handles health checks and token counting endpoints.
 type HealthHandler struct {
-	tokenCounter    *token.Counter
-	fallbackHandler *router.FallbackHandler
-	metrics         *metrics.Metrics
+	tokenCounter *token.Counter
+	metrics      *metrics.Metrics
 }
 
 // NewHealthHandler creates a new health handler.
-func NewHealthHandler(tokenCounter *token.Counter, fallbackHandler *router.FallbackHandler, metrics *metrics.Metrics) *HealthHandler {
+func NewHealthHandler(tokenCounter *token.Counter, metrics *metrics.Metrics) *HealthHandler {
 	return &HealthHandler{
-		tokenCounter:    tokenCounter,
-		fallbackHandler: fallbackHandler,
-		metrics:         metrics,
+		tokenCounter: tokenCounter,
+		metrics:      metrics,
 	}
 }
 
 // HandleHealth handles GET /health.
 func (h *HealthHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
-	// Get metrics snapshot
 	snapshot := h.metrics.GetSnapshot()
-
-	// Get circuit breaker states
-	cbStates := map[string]string{}
-	if h.fallbackHandler != nil {
-		cbStates = h.fallbackHandler.GetCircuitStates()
-	}
 
 	response := map[string]interface{}{
 		"status":  "ok",
@@ -51,8 +41,7 @@ func (h *HealthHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 			"p95_latency_ms":    snapshot.CalculateP95().Milliseconds(),
 			"p99_latency_ms":    snapshot.CalculateP99().Milliseconds(),
 		},
-		"circuit_breakers": cbStates,
-		"models":           snapshot.ModelCounts,
+		"models": snapshot.ModelCounts,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

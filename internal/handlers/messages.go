@@ -12,25 +12,18 @@ import (
 	"time"
 
 	"oc-go-cc/internal/client"
-	"oc-go-cc/internal/config"
 	"oc-go-cc/internal/metrics"
 	"oc-go-cc/internal/middleware"
-	"oc-go-cc/internal/router"
-	"oc-go-cc/internal/token"
 	"oc-go-cc/internal/transformer"
 	"oc-go-cc/pkg/types"
 )
 
 // MessagesHandler handles /v1/messages requests.
 type MessagesHandler struct {
-	config              *config.Config
 	client              *client.OpenCodeClient
-	modelRouter         *router.ModelRouter
-	fallbackHandler     *router.FallbackHandler
 	requestTransformer  *transformer.RequestTransformer
 	responseTransformer *transformer.ResponseTransformer
 	streamHandler       *transformer.StreamHandler
-	tokenCounter        *token.Counter
 	logger              *slog.Logger
 	rateLimiter         *middleware.RateLimiter
 	requestDedup        *middleware.RequestDeduplicator
@@ -67,22 +60,14 @@ func (w *responseWriter) Flush() {
 
 // NewMessagesHandler creates a new messages handler.
 func NewMessagesHandler(
-	cfg *config.Config,
 	openCodeClient *client.OpenCodeClient,
-	modelRouter *router.ModelRouter,
-	fallbackHandler *router.FallbackHandler,
-	tokenCounter *token.Counter,
 	metrics *metrics.Metrics,
 ) *MessagesHandler {
 	return &MessagesHandler{
-		config:              cfg,
 		client:              openCodeClient,
-		modelRouter:         modelRouter,
-		fallbackHandler:     fallbackHandler,
 		requestTransformer:  transformer.NewRequestTransformer(),
 		responseTransformer: transformer.NewResponseTransformer(),
 		streamHandler:       transformer.NewStreamHandler(),
-		tokenCounter:        tokenCounter,
 		logger:              slog.Default(),
 		rateLimiter:         middleware.NewRateLimiter(100, time.Minute),
 		requestDedup:        middleware.NewRequestDeduplicator(500 * time.Millisecond),
@@ -114,7 +99,7 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Read the raw request body for debug logging
+	// Read the raw request body
 	var rawBody json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&rawBody); err != nil {
 		h.sendError(w, http.StatusBadRequest, "invalid request body", err)
@@ -145,69 +130,20 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	isStreaming := anthropicReq.Stream != nil && *anthropicReq.Stream
 	h.metrics.RecordRequest(isStreaming)
 
+	modelID := anthropicReq.Model
+
 	h.logger.Info("received request",
-		"model", anthropicReq.Model,
+		"model", modelID,
 		"streaming", isStreaming,
 		"messages", len(anthropicReq.Messages),
 		"tools", len(anthropicReq.Tools),
 		"max_tokens", anthropicReq.MaxTokens,
 	)
 
-	// Build message content for routing and token counting.
-	var routerMessages []router.MessageContent
-	var tokenMessages []token.MessageContent
-	systemText := anthropicReq.SystemText()
-
-	for _, msg := range anthropicReq.Messages {
-		blocks := msg.ContentBlocks()
-		content := extractTextFromBlocks(blocks)
-		mc := router.MessageContent{
-			Role:    msg.Role,
-			Content: content,
-		}
-		routerMessages = append(routerMessages, mc)
-		tokenMessages = append(tokenMessages, token.MessageContent{
-			Role:    msg.Role,
-			Content: content,
-		})
-	}
-
-	// Count tokens.
-	tokenCount, err := h.tokenCounter.CountMessages(systemText, tokenMessages)
-	if err != nil {
-		h.logger.Warn("failed to count tokens", "error", err)
-		tokenCount = 0
-	}
-
-	// Route to appropriate model.
-	// For streaming, use faster models to minimize TTFT (time-to-first-token)
-	var routeResult router.RouteResult
 	if isStreaming {
-		routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount)
+		h.handleStreaming(w, r, &anthropicReq, modelID, rawBody)
 	} else {
-		var err error
-		routeResult, err = h.modelRouter.Route(routerMessages, tokenCount)
-		if err != nil {
-			h.sendError(w, http.StatusInternalServerError, "routing failed", err)
-			return
-		}
-	}
-
-	h.logger.Info("routing request",
-		"scenario", routeResult.Scenario,
-		"model", routeResult.Primary.ModelID,
-		"tokens", tokenCount,
-	)
-
-	// Build fallback chain.
-	modelChain := routeResult.GetModelChain()
-
-	if isStreaming {
-		// Streaming: use ProxyStream for real-time SSE transformation
-		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody)
-	} else {
-		// Non-streaming: execute with fallback and return full response
-		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		h.handleNonStreaming(w, r, &anthropicReq, modelID, rawBody)
 	}
 }
 
@@ -216,18 +152,13 @@ func (h *MessagesHandler) handleStreaming(
 	w http.ResponseWriter,
 	r *http.Request,
 	anthropicReq *types.MessageRequest,
-	modelChain []config.ModelConfig,
+	modelID string,
 	rawBody json.RawMessage,
 ) {
-	// Each fallback attempt needs its own context with timeout.
-	// Don't share r.Context() across fallbacks - when Claude Code retries,
-	// the original context gets canceled and kills all fallbacks.
 	clientCtx := r.Context()
-
 	rw := &responseWriter{ResponseWriter: w}
 
 	// Set SSE headers immediately so Claude Code knows the stream is alive.
-	// This prevents client-side timeouts before we even start sending data.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -238,17 +169,13 @@ func (h *MessagesHandler) handleStreaming(
 	}
 
 	// Start heartbeat to keep connection alive while waiting for upstream.
-	// Claude Code times out after ~6 seconds of no data, so we send pings every 3 seconds
-	// (frequent enough to prevent timeout, not so frequent as to cause overhead).
 	heartbeatDone := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ticker.C:
-				// Send SSE comment (ignored by client but keeps connection alive)
 				_, _ = fmt.Fprintf(w, ":keepalive\n\n")
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
@@ -260,102 +187,67 @@ func (h *MessagesHandler) handleStreaming(
 			}
 		}
 	}()
-	// Stop heartbeat when streaming completes
 	defer close(heartbeatDone)
 
 	streamStart := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
-	for _, model := range modelChain {
-		// Check if client already disconnected before trying this model
-		select {
-		case <-clientCtx.Done():
-			h.logger.Info("client disconnected, stopping streaming fallbacks")
-			return
-		default:
-		}
+	h.logger.Info("streaming request", "model", modelID)
 
-		h.logger.Info("attempting streaming model", "model", model.ModelID)
-
-		// Create a fresh context with timeout for THIS attempt only.
-		// Don't use r.Context() directly - it gets canceled when Claude Code retries.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-
-		// Check if this is an Anthropic-native model (MiniMax)
-		if client.IsAnthropicModel(model.ModelID) {
-			// For MiniMax models, send raw Anthropic request to Anthropic endpoint
-			// But we need to replace the model name in the raw body
-			modelBody := replaceModelInRawBody(rawBody, model.ModelID)
-			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID); err != nil {
-				cancel()
-				// Check if this was a client disconnect
-				if clientCtx.Err() == context.Canceled {
-					h.logger.Info("client disconnected during anthropic stream")
-					return
-				}
-				h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
-				continue
+	// Anthropic-native model (MiniMax): send raw Anthropic request
+	if client.IsAnthropicModel(modelID) {
+		modelBody := replaceModelInRawBody(rawBody, modelID)
+		if err := h.handleAnthropicStreaming(ctx, rw, modelBody, modelID); err != nil {
+			if clientCtx.Err() == context.Canceled {
+				h.logger.Info("client disconnected during anthropic stream")
+				return
 			}
-			cancel()
-			latency := time.Since(streamStart)
-			h.metrics.RecordSuccess(model.ModelID, latency)
-			h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
+			h.logger.Error("anthropic streaming failed", "model", modelID, "error", err)
+			h.metrics.RecordFailure()
+			h.sendStreamError(rw, "upstream streaming failed")
 			return
 		}
-
-		// For OpenAI-compatible models, transform and send to OpenAI endpoint
-		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
-		if err != nil {
-			cancel()
-			h.logger.Warn("request transform failed", "model", model.ModelID, "error", err)
-			continue
-		}
-
-		// Get streaming body from upstream
-		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq)
-		if err != nil {
-			cancel()
-			// Check if this was a client disconnect (context canceled)
-			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during upstream request")
-				return
-			}
-			h.logger.Warn("streaming request failed", "model", model.ModelID, "error", err)
-			continue
-		}
-
-		// Proxy the stream: transform OpenAI SSE → Anthropic SSE in real-time
-		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx); err != nil {
-			_ = streamBody.Close()
-			cancel()
-			if err == transformer.ErrClientDisconnected {
-				h.logger.Info("client disconnected during stream")
-				return
-			}
-			// Check if this was a client disconnect
-			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during stream (context canceled)")
-				return
-			}
-			h.logger.Warn("stream proxy failed", "model", model.ModelID, "error", err)
-			continue
-		}
-
-		_ = streamBody.Close()
-		cancel()
 		latency := time.Since(streamStart)
-		h.metrics.RecordSuccess(model.ModelID, latency)
-		h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
+		h.metrics.RecordSuccess(modelID, latency)
 		return
 	}
 
-	// All models failed
-	h.metrics.RecordFailure()
-	if !rw.wroteHeader {
-		h.sendError(w, http.StatusBadGateway, "all streaming models failed", nil)
-	} else {
-		// Headers already sent - send error as SSE event
-		h.sendStreamError(rw, "all upstream models failed")
+	// OpenAI-compatible model: transform and stream
+	openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq)
+	if err != nil {
+		h.logger.Error("request transform failed", "model", modelID, "error", err)
+		h.metrics.RecordFailure()
+		h.sendStreamError(rw, "request transform failed")
+		return
 	}
+
+	streamBody, err := h.client.GetStreamingBody(ctx, modelID, openaiReq)
+	if err != nil {
+		if clientCtx.Err() == context.Canceled {
+			h.logger.Info("client disconnected during upstream request")
+			return
+		}
+		h.logger.Error("streaming request failed", "model", modelID, "error", err)
+		h.metrics.RecordFailure()
+		h.sendStreamError(rw, "upstream streaming failed")
+		return
+	}
+	defer streamBody.Close()
+
+	if err := h.streamHandler.ProxyStream(rw, streamBody, modelID, clientCtx); err != nil {
+		if err == transformer.ErrClientDisconnected || clientCtx.Err() == context.Canceled {
+			h.logger.Info("client disconnected during stream")
+			return
+		}
+		h.logger.Error("stream proxy failed", "model", modelID, "error", err)
+		h.metrics.RecordFailure()
+		return
+	}
+
+	latency := time.Since(streamStart)
+	h.metrics.RecordSuccess(modelID, latency)
+	h.logger.Info("streaming completed", "model", modelID, "latency", latency)
 }
 
 // replaceModelInRawBody replaces the model field in raw JSON body with the actual model ID.
@@ -442,42 +334,37 @@ func (h *MessagesHandler) sendStreamError(w http.ResponseWriter, message string)
 	}
 }
 
-// handleNonStreaming handles a non-streaming request with fallback.
+// handleNonStreaming handles a non-streaming request.
 func (h *MessagesHandler) handleNonStreaming(
 	w http.ResponseWriter,
 	r *http.Request,
 	anthropicReq *types.MessageRequest,
-	modelChain []config.ModelConfig,
+	modelID string,
 	rawBody json.RawMessage,
 ) {
 	ctx := r.Context()
 	startTime := time.Now()
 
-	result, responseBody, err := h.fallbackHandler.ExecuteWithFallback(
-		ctx,
-		modelChain,
-		func(ctx context.Context, model config.ModelConfig) ([]byte, error) {
-			// Check if this is an Anthropic-native model (MiniMax)
-			if client.IsAnthropicModel(model.ModelID) {
-				return h.executeAnthropicRequest(ctx, rawBody, model)
-			}
-			// Otherwise use OpenAI transformation
-			return h.executeOpenAIRequest(ctx, anthropicReq, model)
-		},
-	)
+	var responseBody []byte
+	var err error
+
+	if client.IsAnthropicModel(modelID) {
+		responseBody, err = h.executeAnthropicRequest(ctx, rawBody, modelID)
+	} else {
+		responseBody, err = h.executeOpenAIRequest(ctx, anthropicReq, modelID)
+	}
 
 	if err != nil {
 		h.metrics.RecordFailure()
-		h.sendError(w, http.StatusBadGateway, "all models failed", err)
+		h.sendError(w, http.StatusBadGateway, "upstream request failed", err)
 		return
 	}
 
 	latency := time.Since(startTime)
-	h.metrics.RecordSuccess(result.ModelID, latency)
+	h.metrics.RecordSuccess(modelID, latency)
 
 	h.logger.Info("request completed",
-		"model", result.ModelID,
-		"attempts", result.Attempted,
+		"model", modelID,
 		"latency", latency,
 	)
 
@@ -490,22 +377,19 @@ func (h *MessagesHandler) handleNonStreaming(
 func (h *MessagesHandler) executeAnthropicRequest(
 	ctx context.Context,
 	rawBody json.RawMessage,
-	model config.ModelConfig,
+	modelID string,
 ) ([]byte, error) {
-	// Send raw Anthropic request to Anthropic endpoint
-	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, false)
+	modelBody := replaceModelInRawBody(rawBody, modelID)
+	resp, err := h.client.SendAnthropicRequest(ctx, modelBody, false)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Read the response (already in Anthropic format)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
-
-	h.logger.Debug("anthropic response", "body", string(body))
 
 	return body, nil
 }
@@ -514,47 +398,24 @@ func (h *MessagesHandler) executeAnthropicRequest(
 func (h *MessagesHandler) executeOpenAIRequest(
 	ctx context.Context,
 	anthropicReq *types.MessageRequest,
-	model config.ModelConfig,
+	modelID string,
 ) ([]byte, error) {
-	// Transform request to OpenAI format.
-	openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
+	openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq)
 	if err != nil {
 		return nil, fmt.Errorf("request transform failed: %w", err)
 	}
 
-	// Handle non-streaming.
-	resp, err := h.client.ChatCompletionNonStreaming(ctx, model.ModelID, openaiReq)
+	resp, err := h.client.ChatCompletionNonStreaming(ctx, modelID, openaiReq)
 	if err != nil {
 		return nil, fmt.Errorf("chat completion failed: %w", err)
 	}
 
-	// Transform response to Anthropic format.
-	anthropicResp, err := h.responseTransformer.TransformResponse(resp, model.ModelID)
+	anthropicResp, err := h.responseTransformer.TransformResponse(resp, modelID)
 	if err != nil {
 		return nil, fmt.Errorf("response transform failed: %w", err)
 	}
 
 	return json.Marshal(anthropicResp)
-}
-
-// extractTextFromBlocks extracts plain text from Anthropic content blocks.
-func extractTextFromBlocks(blocks []types.ContentBlock) string {
-	var content string
-	for _, block := range blocks {
-		switch block.Type {
-		case "text":
-			content += block.Text
-		case "tool_use":
-			content += fmt.Sprintf("[Tool Use: %s]", block.Name)
-		case "tool_result":
-			content += block.TextContent()
-		case "thinking":
-			// Skip thinking blocks for text extraction
-		case "image":
-			content += "[Image]"
-		}
-	}
-	return content
 }
 
 // sendError sends an error response in Anthropic format.

@@ -239,14 +239,12 @@ func validateCmd() *cobra.Command {
 				return fmt.Errorf("invalid config: %w", err)
 			}
 
-			fmt.Println("Configuration is valid!")
-			fmt.Printf("  Host: %s\n", cfg.Host)
-			fmt.Printf("  Port: %d\n", cfg.Port)
-			fmt.Printf("  API Key: %s...\n", maskString(cfg.APIKey, 8))
-			fmt.Printf("  Base URL: %s\n", cfg.OpenCodeGo.BaseURL)
-			fmt.Printf("  Models configured: %d\n", len(cfg.Models))
-			fmt.Printf("  Fallback chains: %d\n", len(cfg.Fallbacks))
-			return nil
+	fmt.Println("Configuration is valid!")
+	fmt.Printf("  Host: %s\n", cfg.Host)
+	fmt.Printf("  Port: %d\n", cfg.Port)
+	fmt.Printf("  API Key: %s...\n", maskString(cfg.APIKey, 8))
+	fmt.Printf("  Base URL: %s\n", cfg.OpenCodeGo.BaseURL)
+	return nil
 		},
 	}
 
@@ -354,77 +352,11 @@ func maskString(s string, visible int) string {
 }
 
 // getDefaultConfig returns a default configuration JSON template.
-// Optimized for cost-efficiency: uses cheaper models by default, expensive ones only when needed.
 func getDefaultConfig() string {
 	return `{
   "api_key": "${OC_GO_CC_API_KEY}",
   "host": "127.0.0.1",
   "port": 3456,
-  "models": {
-    "background": {
-      "provider": "opencode-go",
-      "model_id": "qwen3.5-plus",
-      "temperature": 0.5,
-      "max_tokens": 2048
-    },
-    "default": {
-      "provider": "opencode-go",
-      "model_id": "kimi-k2.6",
-      "temperature": 0.7,
-      "max_tokens": 4096
-    },
-    "long_context": {
-      "provider": "opencode-go",
-      "model_id": "minimax-m2.5",
-      "temperature": 0.7,
-      "max_tokens": 16384,
-      "context_threshold": 80000
-    },
-    "think": {
-      "provider": "opencode-go",
-      "model_id": "glm-5",
-      "temperature": 0.7,
-      "max_tokens": 8192
-    },
-    "complex": {
-      "provider": "opencode-go",
-      "model_id": "glm-5.1",
-      "temperature": 0.7,
-      "max_tokens": 4096
-    },
-    "fast": {
-      "provider": "opencode-go",
-      "model_id": "qwen3.6-plus",
-      "temperature": 0.7,
-      "max_tokens": 4096
-    }
-  },
-  "fallbacks": {
-    "background": [
-      { "provider": "opencode-go", "model_id": "qwen3.6-plus" },
-      { "provider": "opencode-go", "model_id": "minimax-m2.5" }
-    ],
-    "default": [
-      { "provider": "opencode-go", "model_id": "mimo-v2-pro" },
-      { "provider": "opencode-go", "model_id": "qwen3.6-plus" }
-    ],
-    "long_context": [
-      { "provider": "opencode-go", "model_id": "minimax-m2.7" },
-      { "provider": "opencode-go", "model_id": "kimi-k2.6" }
-    ],
-    "think": [
-      { "provider": "opencode-go", "model_id": "kimi-k2.6" },
-      { "provider": "opencode-go", "model_id": "mimo-v2-pro" }
-    ],
-    "complex": [
-      { "provider": "opencode-go", "model_id": "glm-5" },
-      { "provider": "opencode-go", "model_id": "kimi-k2.6" }
-    ],
-    "fast": [
-      { "provider": "opencode-go", "model_id": "qwen3.5-plus" },
-      { "provider": "opencode-go", "model_id": "minimax-m2.5" }
-    ]
-  },
   "opencode_go": {
     "base_url": "https://opencode.ai/zen/go/v1/chat/completions",
     "anthropic_base_url": "https://opencode.ai/zen/go/v1/messages",

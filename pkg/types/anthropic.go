@@ -11,15 +11,21 @@ import (
 
 // MessageRequest represents a request to the Anthropic Messages API.
 type MessageRequest struct {
-	Model       string          `json:"model"`
-	MaxTokens   int             `json:"max_tokens"`
-	System      json.RawMessage `json:"system,omitempty"`
-	Messages    []Message       `json:"messages"`
-	Stream      *bool           `json:"stream,omitempty"`
-	Tools       []Tool          `json:"tools,omitempty"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	TopP        *float64        `json:"top_p,omitempty"`
-	Metadata    *Metadata       `json:"metadata,omitempty"`
+	Model        string          `json:"model"`
+	MaxTokens    int             `json:"max_tokens"`
+	System       json.RawMessage `json:"system,omitempty"`
+	Messages     []Message       `json:"messages"`
+	Stream       *bool           `json:"stream,omitempty"`
+	Tools        []Tool          `json:"tools,omitempty"`
+	Temperature  *float64        `json:"temperature,omitempty"`
+	TopP         *float64        `json:"top_p,omitempty"`
+	Metadata     *Metadata       `json:"metadata,omitempty"`
+	OutputConfig *OutputConfig   `json:"output_config,omitempty"`
+}
+
+// OutputConfig controls the model's output behavior, including thinking/reasoning effort.
+type OutputConfig struct {
+	Effort string `json:"effort"` // "low", "medium", or "high"
 }
 
 // SystemText extracts the system prompt text from the raw system field.

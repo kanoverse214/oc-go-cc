@@ -87,5 +87,5 @@ func newTestHealthHandler(t *testing.T) *HealthHandler {
 	if err != nil {
 		t.Fatalf("NewCounter() error = %v", err)
 	}
-	return NewHealthHandler(counter, nil, metrics.New())
+	return NewHealthHandler(counter, metrics.New())
 }

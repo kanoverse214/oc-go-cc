@@ -15,7 +15,6 @@ import (
 	"oc-go-cc/internal/config"
 	"oc-go-cc/internal/handlers"
 	"oc-go-cc/internal/metrics"
-	"oc-go-cc/internal/router"
 	"oc-go-cc/internal/token"
 )
 
@@ -43,19 +42,13 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	metrics := metrics.New()
 
 	openCodeClient := client.NewOpenCodeClient(cfg.OpenCodeGo, cfg.APIKey)
-	modelRouter := router.NewModelRouter(cfg)
-	fallbackHandler := router.NewFallbackHandler(logger, 3, 30*time.Second)
 
 	// Create handlers.
 	messagesHandler := handlers.NewMessagesHandler(
-		cfg,
 		openCodeClient,
-		modelRouter,
-		fallbackHandler,
-		tokenCounter,
 		metrics,
 	)
-	healthHandler := handlers.NewHealthHandler(tokenCounter, fallbackHandler, metrics)
+	healthHandler := handlers.NewHealthHandler(tokenCounter, metrics)
 
 	// Setup router.
 	mux := http.NewServeMux()

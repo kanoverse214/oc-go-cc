@@ -5,16 +5,10 @@ import (
 	"encoding/json"
 	"testing"
 
-	"oc-go-cc/internal/config"
 	"oc-go-cc/pkg/types"
 )
 
-// TestTransformRequestRoundTripReasoning verifies that a DeepSeek response with
-// reasoning_content survives the full round-trip (OpenAI response → Anthropic
-// response → Anthropic request → OpenAI request) so that on the next turn
-// DeepSeed receives the reasoning_content it expects.
 func TestTransformRequestRoundTripReasoning(t *testing.T) {
-	// Step 1: Simulate a DeepSeek response with reasoning_content.
 	deepSeekReasoning := "Let me think step by step"
 	openaiResp := &types.ChatCompletionResponse{
 		ID:     "resp_123",
@@ -35,14 +29,12 @@ func TestTransformRequestRoundTripReasoning(t *testing.T) {
 		},
 	}
 
-	// Step 2: Transform to Anthropic format (what Claude Code receives).
 	rt := NewResponseTransformer()
 	anthropicResp, err := rt.TransformResponse(openaiResp, "deepseek-v4-flash")
 	if err != nil {
 		t.Fatalf("TransformResponse error: %v", err)
 	}
 
-	// Verify Anthropic response has a thinking block.
 	if len(anthropicResp.Content) != 2 {
 		t.Fatalf("expected 2 content blocks, got %d", len(anthropicResp.Content))
 	}
@@ -53,10 +45,8 @@ func TestTransformRequestRoundTripReasoning(t *testing.T) {
 		t.Fatalf("thinking text = %q, want %q", anthropicResp.Content[0].Thinking, deepSeekReasoning)
 	}
 
-	// Step 3: Simulate Claude Code sending the conversation back on the next turn.
-	// It includes the previous assistant message with the thinking block.
 	anthropicReq := &types.MessageRequest{
-		Model:     "claude-test",
+		Model:     "deepseek-v4-flash",
 		MaxTokens: 256,
 		Messages: []types.Message{
 			{Role: "user", Content: json.RawMessage(`"What is the answer?"`)},
@@ -68,14 +58,12 @@ func TestTransformRequestRoundTripReasoning(t *testing.T) {
 		},
 	}
 
-	// Step 4: Transform back to OpenAI request.
 	qt := NewRequestTransformer()
-	openaiReq, err := qt.TransformRequest(anthropicReq, config.ModelConfig{ModelID: "deepseek-v4-flash"})
+	openaiReq, err := qt.TransformRequest(anthropicReq)
 	if err != nil {
 		t.Fatalf("TransformRequest error: %v", err)
 	}
 
-	// Find the assistant message.
 	var assistantMsg *types.ChatMessage
 	for i := range openaiReq.Messages {
 		if openaiReq.Messages[i].Role == "assistant" {
@@ -87,7 +75,6 @@ func TestTransformRequestRoundTripReasoning(t *testing.T) {
 		t.Fatal("assistant message not found in transformed request")
 	}
 
-	// Step 5: Verify reasoning_content is preserved.
 	if assistantMsg.ReasoningContent == nil {
 		t.Fatal("ReasoningContent = nil, want non-nil after round-trip")
 	}
@@ -95,7 +82,6 @@ func TestTransformRequestRoundTripReasoning(t *testing.T) {
 		t.Fatalf("ReasoningContent = %q, want %q", got, want)
 	}
 
-	// Also verify the JSON serialization includes the field.
 	body, err := json.Marshal(openaiReq)
 	if err != nil {
 		t.Fatalf("json.Marshal error: %v", err)
@@ -124,7 +110,7 @@ func TestTransformRequestPreservesThinkingAsReasoningContent(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -162,7 +148,7 @@ func TestTransformRequestIncludesStreamUsageOptions(t *testing.T) {
 	stream := true
 
 	req := &types.MessageRequest{
-		Model:     "claude-test",
+		Model:     "deepseek-v4-pro",
 		MaxTokens: 256,
 		Stream:    &stream,
 		Messages: []types.Message{
@@ -170,7 +156,7 @@ func TestTransformRequestIncludesStreamUsageOptions(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -188,7 +174,7 @@ func TestTransformRequestOmitsStreamUsageOptionsWhenStreamingDisabled(t *testing
 	stream := false
 
 	req := &types.MessageRequest{
-		Model:     "claude-test",
+		Model:     "deepseek-v4-pro",
 		MaxTokens: 256,
 		Stream:    &stream,
 		Messages: []types.Message{
@@ -196,7 +182,7 @@ func TestTransformRequestOmitsStreamUsageOptionsWhenStreamingDisabled(t *testing
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -210,7 +196,7 @@ func TestTransformRequestIncludesEmptyReasoningContentForToolCalls(t *testing.T)
 	transformer := NewRequestTransformer()
 
 	req := &types.MessageRequest{
-		Model:     "claude-test",
+		Model:     "kimi-k2.6",
 		MaxTokens: 256,
 		Messages: []types.Message{
 			{
@@ -222,7 +208,7 @@ func TestTransformRequestIncludesEmptyReasoningContentForToolCalls(t *testing.T)
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -240,7 +226,7 @@ func TestTransformRequestSerializesAssistantToolCallContent(t *testing.T) {
 	transformer := NewRequestTransformer()
 
 	req := &types.MessageRequest{
-		Model:     "claude-test",
+		Model:     "deepseek-v4-pro",
 		MaxTokens: 256,
 		Messages: []types.Message{
 			{
@@ -252,7 +238,7 @@ func TestTransformRequestSerializesAssistantToolCallContent(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -276,13 +262,39 @@ func TestTransformRequestSerializesAssistantToolCallContent(t *testing.T) {
 	}
 }
 
-func TestTransformRequestAppliesReasoningEffortAndThinking(t *testing.T) {
+func TestTransformRequestAppliesOutputConfigEffort(t *testing.T) {
 	transformer := NewRequestTransformer()
 
-	// When the conversation history already contains thinking blocks,
-	// reasoning_effort and thinking should be applied.
 	req := &types.MessageRequest{
-		Model:     "claude-test",
+		Model:     "deepseek-v4-pro",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"solve this carefully"`)},
+		},
+		OutputConfig: &types.OutputConfig{Effort: "high"},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req)
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if openaiReq.ReasoningEffort == nil {
+		t.Fatal("ReasoningEffort = nil, want high")
+	}
+	if got, want := *openaiReq.ReasoningEffort, "high"; got != want {
+		t.Fatalf("ReasoningEffort = %q, want %q", got, want)
+	}
+	if got, want := string(openaiReq.Thinking), `{"type":"enabled"}`; got != want {
+		t.Fatalf("Thinking = %s, want %s", got, want)
+	}
+}
+
+func TestTransformRequestAppliesDefaultThinkingWhenHistoryHasThinkingBlocks(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	req := &types.MessageRequest{
+		Model:     "deepseek-v4-pro",
 		MaxTokens: 256,
 		Messages: []types.Message{
 			{Role: "user", Content: json.RawMessage(`"solve this carefully"`)},
@@ -296,19 +308,15 @@ func TestTransformRequestAppliesReasoningEffortAndThinking(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
-		ModelID:         "deepseek-v4-pro",
-		ReasoningEffort: "max",
-		Thinking:        json.RawMessage(`{"type":"enabled"}`),
-	})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
 
 	if openaiReq.ReasoningEffort == nil {
-		t.Fatal("ReasoningEffort = nil, want max")
+		t.Fatal("ReasoningEffort = nil, want high (default)")
 	}
-	if got, want := *openaiReq.ReasoningEffort, "max"; got != want {
+	if got, want := *openaiReq.ReasoningEffort, "high"; got != want {
 		t.Fatalf("ReasoningEffort = %q, want %q", got, want)
 	}
 	if got, want := string(openaiReq.Thinking), `{"type":"enabled"}`; got != want {
@@ -316,14 +324,11 @@ func TestTransformRequestAppliesReasoningEffortAndThinking(t *testing.T) {
 	}
 }
 
-func TestTransformRequestStripsReasoningEffortWhenNoThinkingHistory(t *testing.T) {
+func TestTransformRequestOmitsThinkingWhenNoOutputConfigAndNoHistory(t *testing.T) {
 	transformer := NewRequestTransformer()
 
-	// When the conversation history has NO thinking blocks, reasoning_effort
-	// and thinking should be stripped to avoid DeepSeek's validation error:
-	// "The reasoning_content in the thinking mode must be passed back to the API."
 	req := &types.MessageRequest{
-		Model:     "claude-test",
+		Model:     "deepseek-v4-pro",
 		MaxTokens: 256,
 		Messages: []types.Message{
 			{Role: "user", Content: json.RawMessage(`"solve this carefully"`)},
@@ -331,22 +336,16 @@ func TestTransformRequestStripsReasoningEffortWhenNoThinkingHistory(t *testing.T
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
-		ModelID:         "deepseek-v4-pro",
-		ReasoningEffort: "max",
-		Thinking:        json.RawMessage(`{"type":"enabled"}`),
-	})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
 
 	if openaiReq.ReasoningEffort != nil {
-		t.Fatalf("ReasoningEffort = %v, want nil (stripped because no thinking history)", *openaiReq.ReasoningEffort)
+		t.Fatalf("ReasoningEffort = %v, want nil (no output_config, no thinking history)", *openaiReq.ReasoningEffort)
 	}
-	// We explicitly send thinking: {"type":"disabled"} so DeepSeek knows
-	// not to require reasoning_content on assistant messages.
-	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
-		t.Fatalf("Thinking = %s, want %s", got, want)
+	if openaiReq.Thinking != nil {
+		t.Fatalf("Thinking = %s, want nil (no output_config, no thinking history)", string(openaiReq.Thinking))
 	}
 }
 
@@ -364,7 +363,7 @@ func TestTransformRequestPreservesSystemCacheControl(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -400,7 +399,7 @@ func TestTransformRequestOmitsCacheControlWhenAbsent(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -441,7 +440,7 @@ func TestTransformRequestPlacesToolResultsBeforeUserText(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -471,7 +470,7 @@ func TestTransformRequestOmitsPlaceholderForDeepSeek(t *testing.T) {
 	transformer := NewRequestTransformer()
 
 	req := &types.MessageRequest{
-		Model:     "claude-test",
+		Model:     "deepseek-v4-pro",
 		MaxTokens: 256,
 		Messages: []types.Message{
 			{Role: "user", Content: json.RawMessage(`"hello"`)},
@@ -484,13 +483,12 @@ func TestTransformRequestOmitsPlaceholderForDeepSeek(t *testing.T) {
 		},
 	}
 
-	// DeepSeek should NOT get a placeholder when there's no thinking history
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
 
-	msg := openaiReq.Messages[1] // assistant message
+	msg := openaiReq.Messages[1]
 	if msg.ReasoningContent != nil {
 		t.Fatalf("ReasoningContent = %q, want nil (DeepSeek without thinking history should not get placeholder)", *msg.ReasoningContent)
 	}
@@ -499,12 +497,8 @@ func TestTransformRequestOmitsPlaceholderForDeepSeek(t *testing.T) {
 func TestTransformRequestDeepSeekPlaceholderWithThinkingHistory(t *testing.T) {
 	transformer := NewRequestTransformer()
 
-	// When thinking history exists, DeepSeek assistant messages with tool_calls
-	// but no thinking block MUST get a placeholder reasoning_content, because
-	// DeepSeek requires ALL assistant messages to have reasoning_content in
-	// thinking mode.
 	req := &types.MessageRequest{
-		Model:     "claude-test",
+		Model:     "deepseek-v4-flash",
 		MaxTokens: 256,
 		Messages: []types.Message{
 			{Role: "user", Content: json.RawMessage(`"think about this"`)},
@@ -525,16 +519,11 @@ func TestTransformRequestDeepSeekPlaceholderWithThinkingHistory(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
-		ModelID:         "deepseek-v4-flash",
-		ReasoningEffort: "high",
-		Thinking:        json.RawMessage(`{"type":"enabled"}`),
-	})
+	openaiReq, err := transformer.TransformRequest(req)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
 
-	// Find the second assistant message (tool_call only, no thinking)
 	var toolCallAssistant *types.ChatMessage
 	for i := range openaiReq.Messages {
 		if openaiReq.Messages[i].Role == "assistant" && len(openaiReq.Messages[i].ToolCalls) > 0 {
