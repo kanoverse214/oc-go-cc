@@ -1,3 +1,7 @@
+[**English**](README.md) | [**中文**](README_zh.md)
+
+[**English**](README.md) | [**中文**](README_zh.md)
+
 # oc-go-cc
 
 A Go CLI proxy that lets you use your [OpenCode Go](https://opencode.ai/docs/go/) subscription with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
