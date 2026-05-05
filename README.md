@@ -11,15 +11,15 @@ OpenCode Go gives you access to powerful open coding models for **$5/month** (th
 ## Features
 
 - **Transparent Proxy** — Claude Code sends Anthropic-format requests, proxy transforms to OpenAI format and back
-- **Model Routing** — Automatically routes to different models based on context (default, thinking, long context, background)
-- **Fallback Chains** — If a model fails, automatically tries the next one in your configured chain
-- **Circuit Breaker** — Tracks model health and skips failing models to avoid latency spikes
-- **Real-time Streaming** — Full SSE streaming with live OpenAI → Anthropic format transformation
-- **Tool Calling** — Proper Anthropic tool_use/tool_result ↔ OpenAI function calling translation
-- **Token Counting** — Uses tiktoken (cl100k_base) for accurate token counting and context threshold detection
+- **Model Passthrough** — Passes the model directly from the request; you control which model Claude Code uses
+- **Dual Endpoint Support** — Routes to OpenAI-compatible (`/v1/chat/completions`) or Anthropic-native (`/v1/messages`) endpoints per model
+- **Real-time Streaming** — Full SSE streaming with live OpenAI ↔ Anthropic format transformation
+- **Tool Calling** — Proper Anthropic `tool_use`/`tool_result` ↔ OpenAI function calling translation
+- **DeepSeek Thinking Mode** — Supports `output_config.effort` for reasoning effort control with `reasoning_content` propagation across all assistant messages
 - **JSON Configuration** — Flexible config file with environment variable overrides and `${VAR}` interpolation
 - **Background Mode** — Run as daemon detached from terminal
 - **Auto-start on Login** — Launch on system startup via launchd (macOS)
+- **Rate Limiting & Request Deduplication** — Protects upstream API from abuse
 
 ## Installation
 
@@ -142,7 +142,27 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
 export ANTHROPIC_AUTH_TOKEN=unused
 ```
 
-### 5. Run Claude Code
+### 5. Configure Claude Code Model
+
+Set the model Claude Code should use. For example, DeepSeek V4 Pro with max thinking:
+
+```bash
+# ~/.claude/settings.json
+{
+  "modelOverride": "deepseek-v4-pro",
+  "outputConfig": {
+    "effort": "high"
+  }
+}
+```
+
+Or in Claude Code CLI:
+
+```bash
+claude --model deepseek-v4-pro
+```
+
+### 6. Run Claude Code
 
 ```bash
 claude
@@ -152,6 +172,10 @@ That's it. Claude Code will now route all requests through oc-go-cc to OpenCode 
 
 ## How It Works
 
+The proxy has two distinct paths depending on the model:
+
+**OpenAI-compatible models (most models):**
+
 ```
 ┌─────────────┐     Anthropic API      ┌─────────────┐     OpenAI API       ┌─────────────┐
 │  Claude Code ├──────────────────────►│  oc-go-cc    ├────────────────────►│  OpenCode Go │
@@ -160,12 +184,25 @@ That's it. Claude Code will now route all requests through oc-go-cc to OpenCode 
 └─────────────┘   Anthropic SSE        └─────────────┘   OpenAI SSE          └─────────────┘
 ```
 
+**Anthropic-native models (MiniMax M2.7 / M2.5):**
+
+```
+┌─────────────┐     Anthropic API      ┌─────────────┐    Anthropic API     ┌─────────────┐
+│  Claude Code ├──────────────────────►│  oc-go-cc    ├────────────────────►│  OpenCode Go │
+│  (CLI)       │  POST /v1/messages   │  (Proxy)     │  POST /v1/messages  │  (Upstream)  │
+│              │◄──────────────────────┤              │◄────────────────────┤              │
+└─────────────┘   Anthropic SSE        └─────────────┘   Anthropic SSE      └─────────────┘
+```
+
+For OpenAI-compatible models:
 1. Claude Code sends a request in [Anthropic Messages API](https://docs.anthropic.com/en/api/messages) format
-2. oc-go-cc parses the request, counts tokens, and selects a model via routing rules
-3. The request is transformed to [OpenAI Chat Completions](https://platform.openai.com/docs/api-reference/chat) format
-4. The transformed request is sent to OpenCode Go's endpoint
+2. oc-go-cc parses the request and transforms it to [OpenAI Chat Completions](https://platform.openai.com/docs/api-reference/chat) format
+3. The model ID from Anthropic request is passed through directly — no automatic routing
+4. The transformed request is sent to OpenCode Go's OpenAI endpoint
 5. The response (streaming or non-streaming) is transformed back to Anthropic format
 6. Claude Code receives the response as if it came from Anthropic directly
+
+For Anthropic-native models (MiniMax), the request is forwarded as-is with the model name replaced, requiring no format transformation.
 
 ### What Gets Transformed
 
@@ -184,26 +221,26 @@ That's it. Claude Code will now route all requests through oc-go-cc to OpenCode 
 
 DeepSeek V4 Pro and Flash use the OpenAI-compatible `/chat/completions` endpoint through OpenCode Go. They support thinking mode and configurable reasoning effort.
 
-For Claude Code and other agentic coding workflows, configure DeepSeek V4 models with:
+For Claude Code, configure DeepSeek V4 models with Claude's `output_config.effort`:
 
 ```json
 {
-  "provider": "opencode-go",
-  "model_id": "deepseek-v4-pro",
-  "max_tokens": 8192,
-  "reasoning_effort": "max",
-  "thinking": {
-    "type": "enabled"
+  "modelOverride": "deepseek-v4-pro",
+  "outputConfig": {
+    "effort": "high"
   }
 }
 ```
 
-`oc-go-cc` forwards these fields to OpenCode Go as OpenAI Chat Completions parameters:
+The proxy maps this to OpenAI Chat Completions parameters:
+- `output_config.effort` (`"low"`, `"medium"`, `"high"`) → `reasoning_effort`
+- Thinking blocks in conversation history → `reasoning_effort` + `thinking` flags automatically
 
-- `reasoning_effort`: controls DeepSeek V4 thinking effort (`high` or `max`)
-- `thinking`: enables or disables DeepSeek V4 thinking mode
+When thinking mode is active, `reasoning_content` is propagated to **all** assistant messages (including tool-call messages) to satisfy upstream validator requirements. DeepSeek returns reasoning content as OpenAI `reasoning_content`, which is transformed back into Anthropic `thinking` blocks for Claude Code.
 
-DeepSeek V4 thinking responses are returned as OpenAI `reasoning_content` and transformed back into Anthropic `thinking` blocks for Claude Code.
+The proxy also handles provider-specific validators:
+- **DeepSeek**: requires `reasoning_content` on every assistant message when thinking mode is on (receives a placeholder when the client stripped original thinking)
+- **Moonshot (Kimi)**: requires non-empty `reasoning_content` on tool-call messages
 
 ## Configuration
 
@@ -221,69 +258,9 @@ Override with `OC_GO_CC_CONFIG` environment variable.
   "host": "127.0.0.1",
   "port": 3456,
 
-  "models": {
-    "default": {
-      "provider": "opencode-go",
-      "model_id": "kimi-k2.6",
-      "temperature": 0.7,
-      "max_tokens": 4096
-    },
-    "background": {
-      "provider": "opencode-go",
-      "model_id": "qwen3.5-plus",
-      "temperature": 0.5,
-      "max_tokens": 2048
-    },
-    "think": {
-      "provider": "opencode-go",
-      "model_id": "glm-5.1",
-      "temperature": 0.7,
-      "max_tokens": 8192
-    },
-    "complex": {
-      "provider": "opencode-go",
-      "model_id": "glm-5.1",
-      "temperature": 0.7,
-      "max_tokens": 4096
-    },
-    "long_context": {
-      "provider": "opencode-go",
-      "model_id": "minimax-m2.7",
-      "temperature": 0.7,
-      "max_tokens": 16384,
-      "context_threshold": 80000
-    },
-    "fast": {
-      "provider": "opencode-go",
-      "model_id": "qwen3.6-plus",
-      "temperature": 0.7,
-      "max_tokens": 4096
-    },
-    "deepseek_v4_max": {
-      "provider": "opencode-go",
-      "model_id": "deepseek-v4-pro",
-      "temperature": 0.1,
-      "max_tokens": 8192,
-      "reasoning_effort": "max",
-      "thinking": {
-        "type": "enabled"
-      }
-    }
-  },
-
-  "fallbacks": {
-    "default": [
-      { "provider": "opencode-go", "model_id": "glm-5" },
-      { "provider": "opencode-go", "model_id": "qwen3.6-plus" }
-    ],
-    "think": [{ "provider": "opencode-go", "model_id": "glm-5" }],
-    "complex": [{ "provider": "opencode-go", "model_id": "glm-5" }],
-    "long_context": [{ "provider": "opencode-go", "model_id": "minimax-m2.5" }],
-    "fast": [{ "provider": "opencode-go", "model_id": "qwen3.5-plus" }]
-  },
-
   "opencode_go": {
     "base_url": "https://opencode.ai/zen/go/v1/chat/completions",
+    "anthropic_base_url": "https://opencode.ai/zen/go/v1/messages",
     "timeout_ms": 300000
   },
 
@@ -304,76 +281,31 @@ Environment variables override config file values. Config values also support `$
 | `OC_GO_CC_CONFIG`       | Custom config file path                     | `~/.config/oc-go-cc/config.json`                 |
 | `OC_GO_CC_HOST`         | Proxy listen host                           | `127.0.0.1`                                      |
 | `OC_GO_CC_PORT`         | Proxy listen port                           | `3456`                                           |
-| `OC_GO_CC_OPENCODE_URL` | OpenCode Go API endpoint                    | `https://opencode.ai/zen/go/v1/chat/completions` |
+| `OC_GO_CC_OPENCODE_URL` | OpenCode Go OpenAI API endpoint             | `https://opencode.ai/zen/go/v1/chat/completions` |
 | `OC_GO_CC_LOG_LEVEL`    | Log level: `debug`, `info`, `warn`, `error` | `info`                                           |
 
-### Model Routing
+### Endpoint Selection
 
-The proxy automatically detects the type of request and routes to the appropriate model based on context size and content analysis:
+The proxy automatically selects the correct upstream endpoint based on the model ID:
 
-| Scenario         | Trigger                                             | Model        | Why                                             |
-| ---------------- | --------------------------------------------------- | ------------ | ----------------------------------------------- |
-| **Long Context** | >80K tokens (configurable)                          | MiniMax M2.7 | 1M context window vs 128-256K for others        |
-| **Complex**      | "architect", "refactor", "complex" in system prompt | GLM-5.1      | Best reasoning & architectural understanding    |
-| **Think**        | "think", "plan", "reason" in system prompt          | GLM-5        | Good reasoning, cheaper than GLM-5.1            |
-| **Background**   | "read file", "grep", "list directory"               | Qwen3.5 Plus | Cheapest (~10K req/5hr), perfect for simple ops |
-| **Default**      | Everything else                                     | Kimi K2.6    | Best balance of quality & cost (~1.8K req/5hr)  |
+- **OpenAI endpoint** (`opencode_go.base_url`, default `/v1/chat/completions`) — most models (GLM, Kimi, MiMo, Qwen, DeepSeek)
+- **Anthropic endpoint** (`opencode_go.anthropic_base_url`, default `/v1/messages`) — MiniMax M2.7 / M2.5
 
-**📖 See [MODELS.md](MODELS.md) for detailed model capabilities, costs, and routing recommendations.**
-
-DeepSeek V4 users can set any scenario model to `deepseek-v4-pro` or `deepseek-v4-flash`. For deterministic max thinking, add `reasoning_effort: "max"` and `thinking: {"type":"enabled"}` to that scenario's model config and fallback entries.
-
-#### Routing in Detail:
-
-| Scenario         | Trigger                                                                      | Config Key            | Default Model  |
-| ---------------- | ---------------------------------------------------------------------------- | --------------------- | -------------- |
-| **Default**      | Standard chat                                                                | `models.default`      | `kimi-k2.6`    |
-| **Think**        | System prompt contains "think", "plan", "reason"; or thinking content blocks | `models.think`        | `glm-5.1`      |
-| **Long Context** | Token count exceeds `context_threshold`                                      | `models.long_context` | `minimax-m2.7` |
-| **Background**   | File read, directory list, grep patterns                                     | `models.background`   | `qwen3.5-plus` |
-
-Routing priority: **Long Context** → **Think** → **Background** → **Default**
-
-### Fallback Chains
-
-When a model request fails (network error, rate limit, server error), the proxy tries the next model in the fallback chain:
-
-```
-Primary model → Fallback 1 → Fallback 2 → ... → Error (all failed)
-```
-
-Each model also has a **circuit breaker** that tracks consecutive failures. After 3 failures, the circuit opens and that model is skipped for 30 seconds, then tested again (half-open state).
+Run `oc-go-cc models` to see which models use which endpoint.
 
 ### Available Models
 
-See [MODELS.md](MODELS.md) for **detailed model capabilities, costs, and routing recommendations**.
+See [MODELS.md](MODELS.md) for model capabilities, costs, and recommendations.
 
-Quick reference:
+Run `oc-go-cc models` to see all supported model IDs and their endpoint types.
 
-| Model ID            | Quality | Context | Cost (req/5hr) | Best For                                   |
-| ------------------- | ------- | ------- | -------------- | ------------------------------------------ |
-| `glm-5.1`           | ★★★★★   | 200K    | ~880           | Complex architecture, difficult tasks      |
-| `glm-5`             | ★★★★☆   | 200K    | ~1,150         | High-quality coding, refactoring           |
-| `kimi-k2.6`         | ★★★★★   | 256K    | ~1,850         | **Default** - best balance                 |
-| `kimi-k2.5`         | ★★★★☆   | 256K    | ~1,850         | Fallback - solid quality                   |
-| `mimo-v2-pro`       | ★★★★☆   | 128K    | ~1,290         | Code completion, generation                |
-| `mimo-v2-omni`      | ★★★☆☆   | 256K    | ~2,150         | Fast prototyping                           |
-| `qwen3.6-plus`      | ★★★☆☆   | 128K    | ~3,300         | Cost-effective general coding              |
-| `minimax-m2.7`      | ★★★☆☆   | **1M**  | ~3,400         | **Long context specialist**                |
-| `minimax-m2.5`      | ★★☆☆☆   | **1M**  | ~6,300         | Long context on a budget                   |
-| `deepseek-v4-pro`   | ★★★★★   | **1M**  | varies         | Agentic coding, max thinking, long context |
-| `deepseek-v4-flash` | ★★★★☆   | **1M**  | varies         | Fast agent tasks, background/subagent work |
-| `qwen3.5-plus`      | ★★☆☆☆   | 128K    | ~10,200        | **Cheapest** - background tasks            |
-
-> **💡 Tip:** The cost column shows approximate requests per 5-hour block ($12). Qwen3.5 Plus gives you ~10x more requests than GLM-5.1!
-
-> **⚠️ Important:** MiniMax M2.5 and M2.7 use the **Anthropic-compatible** `/v1/messages` endpoint natively. DeepSeek V4 Pro and Flash use the **OpenAI-compatible** `/chat/completions` endpoint and support `reasoning_effort` plus `thinking` for max thinking mode. See [MODELS.md](MODELS.md) for details.
+> **⚠️ Important:** MiniMax M2.5 and M2.7 use the **Anthropic-compatible** `/v1/messages` endpoint natively — requests pass through without format transformation. All other models use the OpenAI-compatible `/chat/completions` endpoint with format transformation.
 
 ## CLI Commands
 
 ```
 oc-go-cc serve              Start the proxy server
-oc-go-cc serve -b          Start in background (detached from terminal)
+oc-go-cc serve -b           Start in background (detached from terminal)
 oc-go-cc serve --port 8080  Start on a custom port
 oc-go-cc serve --config /path/to/config.json  Use a custom config
 oc-go-cc stop               Stop the running proxy server
@@ -383,7 +315,7 @@ oc-go-cc autostart disable  Disable auto-start on login
 oc-go-cc autostart status   Check autostart status
 oc-go-cc init               Create default configuration file
 oc-go-cc validate           Validate configuration file
-oc-go-cc models             List available OpenCode Go models
+oc-go-cc models             List available OpenCode Go models and endpoint types
 oc-go-cc --version          Show version
 ```
 
@@ -419,13 +351,14 @@ Or set the environment variable:
 export OC_GO_CC_LOG_LEVEL=debug
 ```
 
-### "all models failed" Error
+### "upstream request failed" Error
 
-All models in the fallback chain returned errors. Check:
+The upstream OpenCode Go API returned an error. Check:
 
 1. Your API key is valid: `oc-go-cc validate`
 2. You haven't exceeded your [usage limits](https://opencode.ai/auth)
 3. The OpenCode Go service is reachable: `curl -H "Authorization: Bearer $OC_GO_CC_API_KEY" https://opencode.ai/zen/go/v1/models`
+4. The model you specified in Claude Code exists and supports the features you're requesting (e.g., thinking mode)
 
 ### Connection Refused
 
@@ -463,6 +396,7 @@ This logs:
 - Transformed OpenAI request sent to OpenCode Go
 - Raw OpenAI response received
 - SSE stream events during streaming
+- Upstream SSE chunk and data details for DeepSeek thinking mode
 
 ## Architecture
 
@@ -470,12 +404,8 @@ This logs:
 cmd/oc-go-cc/main.go           CLI entry point (cobra commands)
 internal/
 ├── config/
-│   ├── config.go               Config types
+│   ├── config.go               Config types (api_key, host, port, opencode_go, logging)
 │   └── loader.go               JSON loading, env overrides, ${VAR} interpolation
-├── router/
-│   ├── model_router.go         Model selection based on scenario
-│   ├── scenarios.go            Scenario detection (default/think/long_context/background)
-│   └── fallback.go            Fallback handler with circuit breaker
 ├── server/
 │   └── server.go               HTTP server setup, graceful shutdown, PID management
 ├── handlers/
@@ -486,9 +416,16 @@ internal/
 │   ├── response.go             OpenAI → Anthropic response transformation
 │   └── stream.go               Real-time SSE stream transformation
 ├── client/
-│   └── opencode.go             OpenCode Go HTTP client
-└── token/
-    └── counter.go              Tiktoken token counter (cl100k_base)
+│   └── opencode.go             OpenCode Go HTTP client (dual endpoint support)
+├── middleware/
+│   ├── rate_limiter.go         Per-client rate limiting
+│   └── dedup.go                Request deduplication
+├── metrics/
+│   └── metrics.go              Prometheus-style request metrics
+├── token/
+│   └── counter.go              Tiktoken token counter (cl100k_base)
+└── daemon/
+    └── daemon.go               Background daemon and PID management
 pkg/types/
 ├── anthropic.go                Anthropic API types (polymorphic system/content fields)
 └── openai.go                   OpenAI API types
@@ -500,8 +437,10 @@ configs/
 
 - **Polymorphic field handling**: Anthropic's `system` and `content` fields accept both strings and arrays. We use `json.RawMessage` with accessor methods (`SystemText()`, `ContentBlocks()`) to handle both formats correctly.
 - **Real-time stream proxying**: SSE events are transformed in-flight, not buffered. This means Claude Code sees responses as they arrive from OpenCode Go.
-- **Circuit breaker per model**: Each model gets its own circuit breaker. After 3 consecutive failures, the model is skipped for 30 seconds, then tested again.
+- **Model passthrough**: The model ID from Claude Code's request is passed through directly. No automatic routing or model selection — what you configure in Claude Code is what gets used.
+- **Dual endpoint routing**: Per-model routing to OpenAI or Anthropic endpoints based on `client.IsAnthropicModel()`, determined by model ID prefix.
 - **Environment variable interpolation**: Config values like `"${OC_GO_CC_API_KEY}"` are resolved at load time, so you never need to put secrets in the config file.
+- **DeepSeek thinking**: When `output_config.effort` is set or conversation history contains thinking blocks, `reasoning_content` is added to all assistant messages to satisfy upstream validator requirements.
 
 ## Development
 
